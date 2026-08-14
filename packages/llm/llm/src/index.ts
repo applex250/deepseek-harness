@@ -63,7 +63,40 @@ declare module '@deepseek-ai/cordis' {
      */
     'llm/stream'(this: LlmRuntime, options: GenerateOptions, next: () => AsyncIterable<StreamChunk>): AsyncIterable<StreamChunk>
 
+    /**
+     * Transform the fully assembled request immediately before adapter
+     * dispatch (after config resolution, before serialization). Listeners
+     * return a replacement request (usually a new object whose `messages`
+     * drop blocks the target adapter cannot serialize) or delegate with
+     * `next()`; the original request is used when no listener answers.
+     * Routing fields stay untouched, so adapter selection is unaffected.
+     * Unlike `llm/stream` — whose loop-built requests arrive read-only —
+     * this hook exists for content replacement, e.g. stripping image blocks
+     * that a text-only adapter would reject while keeping the text
+     * descriptions the `prompt/image-fallback` hook wrote into the session.
+     * @mode waterfall
+     * @param payload - the fully assembled request
+     * @param next - delegate to the next listener; returns its result or undefined
+     */
+    'llm/request-content'(
+      this: LlmRuntime,
+      payload: LlmRequestContentPayload,
+      next: () => Promise<LlmRequestContentResult | undefined>,
+    ): Promise<LlmRequestContentResult | undefined>
+
   }
+}
+
+/** Payload of the `llm/request-content` waterfall. */
+export interface LlmRequestContentPayload {
+  /** Fully assembled request whose content listeners may replace. */
+  options: GenerateOptions
+}
+
+/** Result of a content transformation: the replacement request. */
+export interface LlmRequestContentResult {
+  /** Replacement request; listeners replace `messages` and keep routing fields. */
+  options: GenerateOptions
 }
 
 /** Structured provider facts and cause accepted by {@link LlmError}. */
@@ -846,6 +879,18 @@ export class LlmRuntime extends Service {
   ): AsyncGenerator<StreamChunk> {
     let iterator: AsyncIterator<StreamChunk>
     try {
+      // Content-transformation extension point: listeners may replace the
+      // assembled request (e.g. strip image blocks a text-only adapter would
+      // reject, keeping the text descriptions written by the image-degrade
+      // hook). Routing fields stay untouched, so adapter selection below is
+      // unaffected; no listener answering keeps the request byte-identical.
+      const transformed = await this.ctx.waterfall(
+        this,
+        'llm/request-content',
+        { options },
+        () => Promise.resolve(undefined),
+      )
+      if (transformed !== undefined) options = transformed.options
       const registration = prepared?.registration ?? this.registration(options.provider)
       const resolvedConfig = prepared === undefined
         ? (await this.resolveCallFor(registration, options, options.signal)).config

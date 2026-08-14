@@ -1042,6 +1042,58 @@ describe('LlmRuntime', () => {
     expect(adapter.lastOptions?.provider).toBe('routed')
   })
 
+  it('lets llm/request-content listeners replace the assembled messages before adapter dispatch', async () => {
+    const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    const adapter = new RecordingAdapter(SCRIPT)
+    ctx.llm.registerAdapter(['text-route'], adapter)
+    ctx.on('llm/request-content', payload => ({
+      options: {
+        ...payload.options,
+        messages: payload.options.messages.map(message => ({
+          ...message,
+          content: message.content.filter(block => block.type !== 'image'),
+        })),
+      },
+    }))
+
+    for await (const _chunk of ctx.llm.stream({
+      provider: 'text-route',
+      model: 'm',
+      messages: [createMessage({
+        role: 'user',
+        content: [
+          { type: 'text', text: 'description written by the degrade hook' },
+          {
+            type: 'image',
+            attachment: {
+              attachmentId: 'att-1', mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+            },
+          },
+        ] as never,
+        source: { kind: 'user' },
+      })],
+    })) { /* drain */ }
+
+    expect(adapter.lastOptions?.messages[0]?.content).toEqual([
+      { type: 'text', text: 'description written by the degrade hook' },
+    ])
+  })
+
+  it('passes the assembled request through unchanged when no llm/request-content listener answers', async () => {
+    const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    const adapter = new RecordingAdapter(SCRIPT)
+    ctx.llm.registerAdapter(['plain'], adapter)
+    const messages = [createMessage({
+      role: 'user',
+      content: [{ type: 'text', text: 'x' }],
+      source: { kind: 'user' },
+    })]
+    for await (const _chunk of ctx.llm.stream({ provider: 'plain', model: 'm', messages })) { /* drain */ }
+    expect(adapter.lastOptions?.messages).toEqual(messages)
+  })
+
   it('keeps replay state when historical and target providers belong to the same adapter instance', async () => {
     const ctx = new Context()
     await ctx.plugin(LlmRuntime)

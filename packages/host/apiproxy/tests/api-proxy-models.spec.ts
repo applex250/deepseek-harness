@@ -498,3 +498,154 @@ describe('Web session model selection', () => {
     await ctx.fiber.dispose()
   })
 })
+
+describe('prompt image degradation via the prompt/image-fallback waterfall', () => {
+  function imagePart(data: string, name?: string) {
+    return { type: 'image' as const, mediaType: 'image/png' as const, data, ...(name === undefined ? {} : { name }) }
+  }
+
+  function attachmentsFixture(ctx: Context, saveImage: ReturnType<typeof vi.fn>) {
+    ctx.provide('attachments', {
+      imageLimits: {
+        maxImageBytes: 100,
+        maxImagesPerMessage: 4,
+        maxMessageImageBytes: 100,
+        maxImagePixels: 4,
+        mediaTypes: ['image/png'],
+      },
+      validateImage: vi.fn(() => Promise.resolve()),
+      saveImage,
+    } as never)
+  }
+
+  it('refuses image content on a text-only model when no listener answers', async () => {
+    const { ctx, sessionId } = await harness()
+    registerTextOnly(ctx)
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'text-only', model: 'plain' }),
+      cwd: '/tmp',
+    })
+
+    const result = await api.sessions.prompt(request({
+      sessionId,
+      mode: 'queue' as const,
+      content: [
+        { type: 'text' as const, text: 'what is this?' },
+        imagePart('AQ=='),
+      ],
+    }))
+    expect(result.result).toMatchObject({
+      ok: false,
+      error: { code: 'attachment-error', details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' } },
+    })
+    await ctx.fiber.dispose()
+  })
+
+  it('admits content degraded by a listener, persisting image blocks and the description text', async () => {
+    const { ctx, agent, sessionId } = await harness()
+    registerTextOnly(ctx)
+    const saveImage = vi.fn((input: { data: Uint8Array; mediaType: 'image/png'; name?: string }) => Promise.resolve({
+      attachmentId: 'att-degraded',
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 1,
+      height: 1,
+      ...(input.name === undefined ? {} : { name: input.name }),
+    }))
+    attachmentsFixture(ctx, saveImage)
+    ctx.on('prompt/image-fallback', async payload => ({
+      content: [
+        ...payload.content,
+        { type: 'text' as const, text: '[粘贴图片的视觉描述] a red square' },
+      ],
+    }))
+    const followup = vi.fn()
+    Object.assign(agent, { followup })
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'text-only', model: 'plain' }),
+      cwd: '/tmp',
+    })
+
+    const result = await api.sessions.prompt(request({
+      sessionId,
+      mode: 'queue' as const,
+      content: [
+        { type: 'text' as const, text: 'what color?' },
+        imagePart('AQ==', 'shot.png'),
+      ],
+    }))
+    expect(result.result.ok).toBe(true)
+    const message = followup.mock.calls[0]?.[0] as UserMessage
+    expect(message.content).toEqual([
+      { type: 'text', text: 'what color?' },
+      {
+        type: 'image',
+        attachment: {
+          attachmentId: 'att-degraded', mediaType: 'image/png', bytes: 1, width: 1, height: 1, name: 'shot.png',
+        },
+      },
+      { type: 'text', text: '[粘贴图片的视觉描述] a red square' },
+    ])
+    await ctx.fiber.dispose()
+  })
+
+  it('keeps the refusal when a listener throws', async () => {
+    const { ctx, sessionId } = await harness()
+    registerTextOnly(ctx)
+    ctx.on('prompt/image-fallback', async () => {
+      throw new Error('vision api down')
+    })
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'text-only', model: 'plain' }),
+      cwd: '/tmp',
+    })
+
+    const result = await api.sessions.prompt(request({
+      sessionId,
+      mode: 'queue' as const,
+      content: [imagePart('AQ==')],
+    }))
+    expect(result.result).toMatchObject({
+      ok: false,
+      error: { code: 'attachment-error', details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' } },
+    })
+    await ctx.fiber.dispose()
+  })
+
+  it('does not trigger the waterfall when the model accepts images', async () => {
+    const { ctx, agent, sessionId } = await harness()
+    ctx.llm.registerAdapter(['vision'], new class extends CatalogAdapter {
+      override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+        return Promise.resolve({ provider, id: model, name: model, inputModalities: ['text', 'image'] })
+      }
+    }('Vision', []))
+    const saveImage = vi.fn((input: { data: Uint8Array; mediaType: 'image/png' }) => Promise.resolve({
+      attachmentId: 'att-native',
+      mediaType: input.mediaType,
+      bytes: input.data.byteLength,
+      width: 1,
+      height: 1,
+    }))
+    attachmentsFixture(ctx, saveImage)
+    const listener = vi.fn(async () => ({ content: [] }))
+    ctx.on('prompt/image-fallback', listener)
+    const followup = vi.fn()
+    Object.assign(agent, { followup })
+    const api = createApiProxy(ctx, {
+      defaultModelSelection: () => ({ provider: 'vision', model: 'multi' }),
+      cwd: '/tmp',
+    })
+
+    const result = await api.sessions.prompt(request({
+      sessionId,
+      mode: 'queue' as const,
+      content: [
+        { type: 'text' as const, text: 'see?' },
+        imagePart('AQ=='),
+      ],
+    }))
+    expect(result.result.ok).toBe(true)
+    expect(listener).not.toHaveBeenCalled()
+    await ctx.fiber.dispose()
+  })
+})

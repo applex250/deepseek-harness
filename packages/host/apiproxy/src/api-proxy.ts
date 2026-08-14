@@ -114,6 +114,51 @@ import { canOpenNativePath, openNativePath, openNativeTextFile } from './native-
 const DEFAULT_MAX_MESSAGES = 50
 
 /**
+ * Payload of the `prompt/image-fallback` waterfall: the admission path asks
+ * plugins to degrade image parts of an incoming prompt into text when the
+ * session model does not accept image input. Listeners return replacement
+ * content (image parts stay in the session log for the UI, text descriptions
+ * reach the model) or delegate via `next()` to preserve the default
+ * `attachment-error` refusal.
+ */
+export interface PromptImageFallbackPayload {
+  /** Session agent whose prompt is being admitted. */
+  agent: Agent
+  /** Current model selection that rejected image input. */
+  model: ModelSelection
+  /** Browser-submitted prompt content (image parts carry base64 data). */
+  content: readonly PromptContentPart[]
+}
+
+/** Result of a successful image degradation: the replacement content to admit. */
+export interface PromptImageFallbackResult {
+  /**
+   * Replacement content. Image parts are admitted into the session log and
+   * stripped from model requests by the companion `llm/request-content`
+   * waterfall; text descriptions ride the request so the model can answer.
+   */
+  content: readonly PromptContentPart[]
+}
+
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * Ask plugins to degrade image parts of an incoming prompt into text when
+     * the session model does not support image input. A listener returns a
+     * replacement content or delegates with `next()`; the host refuses the
+     * prompt with `attachment-error` when no listener answers.
+     * @mode waterfall
+     * @param payload - the session agent, current model selection, and browser-submitted prompt content
+     * @param next - delegate to the next listener; returns its result or undefined
+     */
+    'prompt/image-fallback'(
+      payload: PromptImageFallbackPayload,
+      next: () => Promise<PromptImageFallbackResult | undefined>,
+    ): Promise<PromptImageFallbackResult | undefined>
+  }
+}
+
+/**
  * Non-model settings namespaces intentionally served to the Web client. The
  * plugin-owned entries (`agent-loop`, `bash`, `web-search-deepseek`) are the
  * host-plane sections the plugin configuration page edits; a namespace absent
@@ -2459,7 +2504,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       },
 
       async prompt(request) {
-        const { sessionId, mode, content, clientTimeZone } = request.payload
+        const { sessionId, mode, content: submittedContent, clientTimeZone } = request.payload
         const canonicalTimeZone = clientTimeZone === undefined
           ? undefined
           : canonicalClientTimeZone(clientTimeZone)
@@ -2479,6 +2524,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           rpcId: request.rpcId,
           ...(canonicalTimeZone === undefined ? {} : { clientTimeZone: canonicalTimeZone }),
         }
+        let content: readonly PromptContentPart[] = submittedContent
         const hasImage = content.some(part => part.type === 'image')
         const admit = async (): Promise<RpcResponse<{ accepted: true }>> => {
           try {
@@ -2486,11 +2532,25 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
               const current = selectionFor(agent).current
               const modelInfo = await ctx.llm.resolveModelInfo(current.provider, current.model)
               if (modelInfo.inputModalities !== undefined && !modelInfo.inputModalities.includes('image')) {
-                return err(request, {
-                  code: 'attachment-error',
-                  message: `Model "${current.model}" does not support image input.`,
-                  details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
-                })
+                let degraded: PromptImageFallbackResult | undefined
+                try {
+                  degraded = await ctx.waterfall(
+                    'prompt/image-fallback',
+                    { agent, model: current, content },
+                    () => Promise.resolve(undefined),
+                  )
+                } catch (error: unknown) {
+                  ctx.logger.warn(`prompt.image-fallback listener failed: ${String(error)}`)
+                  degraded = undefined
+                }
+                if (degraded === undefined) {
+                  return err(request, {
+                    code: 'attachment-error',
+                    message: `Model "${current.model}" does not support image input.`,
+                    details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
+                  })
+                }
+                content = degraded.content
               }
             }
             const durable = await durablePromptContent(ctx, content)
